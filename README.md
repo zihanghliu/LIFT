@@ -4,9 +4,11 @@ Zihang Liu, Tianyu Pang, Oleg Balabanov, Chaoqun Yang, Tianjin Huang, Lu Yin, Ya
 
 [Link to Paper](https://arxiv.org/abs/2506.00772)
 
-<p align="center">
-    <img src="./figures/ICML_LIFT_teaser.png"  width="748.1" height="423.0">
-</p>
+![system](assets/ICML_LIFT_teaser.png)
+
+## Abstract
+
+Recent studies have shown that supervised fine-tuning of LLMs on a small number of high-quality datasets can yield strong reasoning capabilities. However, full fine-tuning (Full FT), while powerful, is computationally expensive and susceptible to overfitting and catastrophic forgetting, particularly when data is limited. Sparse fine-tuning, which previously achieved notable success by updating only a small subset of model parameters, offers a promising trade-off between efficiency and effectiveness. Yet, it has lagged behind in the LLM era due to the difficulty of identifying parameters truly critical for reasoning. In this work, we state that weights with the largest magnitude after low-rank approximation are critical weights for fine-tuning, which we call *Principal Weights*. Surprisingly, while magnitude-based sparse fine-tuning performs poorly as a baseline on LLM fine-tuning, it becomes highly effective after rank reduction. These insights motivate our method: **L**ow-rank **I**nformed Sparse **F**ine-**T**uning ($\texttt{LIFT}$). $\texttt{LIFT}$ only updates the top 5% *Principal Weights* throughout training and consistently achieves better performance on reasoning tasks than Full FT, while maintaining memory efficiency on par with popular parameter-efficient fine-tuning methods.  In addition to strong performance on target domains such as arithmetic reasoning, $\texttt{LIFT}$ also retains up to 20% more source-domain knowledge, compared to Full FT and LoRA.
 
 ### Environment Setup
 ```bash
