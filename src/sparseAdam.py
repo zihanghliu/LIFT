@@ -56,7 +56,7 @@ class SparseAdamW(Optimizer):
         weight_decay: float = 0.0,
         correct_bias: bool = True,
         no_deprecation_warning: bool = False,
-        mask_type: str = "random",
+        mask_type: str = "weight_filtered_mag_abs_largest",
     ):
         if not no_deprecation_warning:
             warnings.warn(
