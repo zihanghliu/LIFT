@@ -5,7 +5,7 @@ Zihang Liu, Tianyu Pang, Oleg Balabanov, Chaoqun Yang, Tianjin Huang, Lu Yin, Ya
 [Link to Paper](https://arxiv.org/abs/2506.00772)
 
 <p align="center">
-    <img src="./figures/ICML_LIFT_teaser.png"  width="755.2" height="376.8">
+    <img src="./figures/ICML_LIFT_teaser.png"  width="748.1" height="423.0">
 </p>
 
 ### Environment Setup
