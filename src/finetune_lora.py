@@ -13,10 +13,11 @@ import math
 import time
 import argparse
 from tqdm.auto import tqdm
+import deepspeed
+
 
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
-import torch.nn as nn
 
 import transformers
 from transformers import (
@@ -26,11 +27,39 @@ from transformers import (
     LlamaTokenizer,
     LlamaTokenizerFast,
     SchedulerType,
+    DataCollatorForSeq2Seq,
     get_scheduler,
+    GPTNeoXTokenizerFast,
+    GPT2Tokenizer,
+    OPTForCausalLM,
+    BitsAndBytesConfig,
+    PreTrainedTokenizerFast,
 )
+
+# from peft import (  # noqa: E402
+#     LoraConfig,
+#     # DoraConfig,
+#     BottleneckConfig,
+#     PrefixTuningConfig,
+#     get_peft_model,
+#     get_peft_model_state_dict,
+#     # prepare_model_for_int8_training,
+#     set_peft_model_state_dict,
+# )
+from peft import (  # noqa: E402
+    LoraConfig,
+    PrefixTuningConfig,
+    get_peft_model,
+    get_peft_model_state_dict,
+    set_peft_model_state_dict,
+    prepare_model_for_kbit_training,
+)
+
 
 from utils.utils import (
     print_rank_0,
+    to_device,
+    set_random_seed,
     get_all_reduce_mean,
     int_or_float,
 )
@@ -40,9 +69,11 @@ from accelerate.utils import set_seed
 
 from utils.model_utils import (
     load_hf_tokenizer,
+    create_hf_model,
     save_hf_format,
     get_optimizer_grouped_parameters,
     make_model_gradient_checkpointing_compatible,
+    print_throughput
 )
 
 from utils.data_utils import SupervisedDataset, DataCollatorForSupervisedDataset
@@ -212,45 +243,58 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--no_grad",
-        type=str,
-        default='none',
-        help="sparse fine-tuning tuner",
-    )
-
-    parser.add_argument(
-        "--mask_type",
-        type=str,
-        default='weight_filtered_mag_abs_largest',
-        help="sparse fine-tuning tuner",
-    )
-
-    parser.add_argument(
-        "--update_interval",
-        type=int,
-        default=200,
-        help="sparse fine-tuning tuner",
-    )
-
-    parser.add_argument(
-        "--lora_rank",
-        type=int,
-        default=128,
-        help="sparse fine-tuning tuner",
-    )
-
-    parser.add_argument(
-        "--filter_rank",
-        type=int,
-        default=128,
-        help="sparse fine-tuning tuner",
-    )
-
-    parser.add_argument(
         "--use_flash_attn",
         type=str,
         default='False',
         help="sparse fine-tuning tuner",
+    )
+
+    parser.add_argument(
+        "--adapter_name",
+        type=str,
+        default='lora',
+        help="sparse fine-tuning tuner",
+    )
+
+    parser.add_argument(
+        "--lora_r",
+        type=int,
+        default=16,
+        help="save deepspeed engine checkpoint for recover the training",
+    )
+
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=32,
+        help="save deepspeed engine checkpoint for recover the training",
+    )
+
+    parser.add_argument(
+        "--lora_dropout",
+        type=float,
+        default=0.05,
+        help="save deepspeed engine checkpoint for recover the training",
+    )
+
+    parser.add_argument(
+        "--target_modules",  # Argument name
+        nargs="+",                # Allows multiple inputs
+        type=str,                 # Each input should be a string
+        default=["q_proj", "k_proj", "v_proj", "up_proj", "down_proj"],
+        help="List of LoRA target modules separated by spaces."
+    )
+    parser.add_argument(
+        "--Wdecompose_target_modules",  # Argument name
+        nargs="+",                # Allows multiple inputs
+        type=str,                 # Each input should be a string
+        default=None,
+        help="List of LoRA target modules separated by spaces."
+    )
+
+    parser.add_argument(
+        "--dora_simple",
+        action='store_true',
     )
 
     parser.add_argument(
@@ -260,13 +304,7 @@ def parse_args():
         help="sparse fine-tuning tuner",
     )
 
-    parser.add_argument(
-        "--adapter_name",
-        type=str,
-        default='none',
-        help="sparse fine-tuning tuner",
-    )
-
+    parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
 
     return args
@@ -293,17 +331,14 @@ def main():
     config = AutoConfig.from_pretrained(args.model_name_or_path)
 
     if args.model_name_or_path:
-        model_kwargs = {}
-        model_kwargs['torch_dtype'] = torch.bfloat16
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-            use_flash_attention_2=True if args.use_flash_attn == 'True' else False,
-            **model_kwargs
+            load_in_8bit=False,
+            torch_dtype=torch.float16,
+            device_map={"": int(os.environ.get("LOCAL_RANK") or 0)},
+            trust_remote_code=True,
         )
     else:
-        # model = AutoModelForCausalLM.from_config(config)
         model = AutoModelForCausalLM.from_config(config)
 
     model.config.end_token_id = tokenizer.eos_token_id
@@ -316,6 +351,59 @@ def main():
     if args.gradient_checkpointing:
         model = make_model_gradient_checkpointing_compatible(model)
         model.gradient_checkpointing_enable()
+
+    # model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+
+    print("Target Modules:")
+    print(args.target_modules)
+
+    if args.adapter_name in ["lora", "dora", "pissa"]:
+        if args.adapter_name == "lora":
+            print(f"LoRA Init")
+            config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=args.target_modules,
+                lora_dropout=args.lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+        elif args.adapter_name == 'dora':
+            print(f"DoRA Init")
+            config = LoraConfig(
+                use_dora=True,
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=args.target_modules,
+                lora_dropout=args.lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+        elif args.adapter_name == "pissa":
+            print("Pissa init")
+            config = LoraConfig(
+                # init_lora_weights="pissa", # Configure the initialization method to "pissa", which may take several minutes to execute SVD on the pre-trained model.
+                init_lora_weights="pissa_niter_4", # Initialize the PiSSA with fast SVD, which completes in just a few seconds.
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=0, # Since the component of the PiSSA adapter are the principal singular values and vectors, dropout should be set to 0 to avoid random discarding.
+                target_modules=args.target_modules,
+                task_type="CAUSAL_LM",
+            )
+        model = get_peft_model(model, config)
+        model.print_trainable_parameters()
+    elif args.adapter_name == "hira":
+        print(f"HiRA Init")
+        model = convert_layer_to_hira(args, model, args.target_modules)
+        for name, param in model.named_parameters():
+            # check if param belongs to HiraLayer
+            if "hira" not in name:
+                param.requires_grad = False
+
+    print(model)
+    print(model.dtype)
+
+    # config.save_pretrained(args.output_dir)
 
     # Prepare datasets
     if len(args.data_path) == 1 and ".json" in args.data_path[0]:
@@ -334,31 +422,8 @@ def main():
     else:
         raise ValueError("Only json format is supported for now.")
 
-    if 'sparse' in args.peft_tuner:
-        layer_dict = {
-            'q': 'q_proj',
-            'k': 'k_proj',
-            'v': 'v_proj',
-            'o': 'o_proj',
-            'gate': 'gate_proj',
-            'up': 'up_proj',
-            'down': 'down_proj'
-        }
-        no_grad_params = ["bias", "layernorm", "norm"]
-        for char, val in layer_dict.items():
-            if char == 'o':
-                char = 'o_'
-            if char in args.no_grad:
-                no_grad_params.append(val)
-        if 'head' in args.no_grad:
-            no_grad_params += ['lm_head', "embed_tokens"]
-        for name, param in model.named_parameters():
-            if any([s in name for s in no_grad_params]):
-                param.requires_grad = False
-
     for name, param in model.named_parameters():
         if not param.requires_grad:
-            # print(f'param {name} is not trainable')
             pass
         else:
             print(f'param {name} is trainable')
@@ -383,21 +448,11 @@ def main():
        args, model, args.weight_decay, args.learning_rate
     )
 
-    ## Init optimizer
-    if 'sparse' in args.peft_tuner:
-        from sparseAdam import SparseAdamW
-        optimizer = SparseAdamW(
-            optimizer_grouped_parameters, lr=args.learning_rate, betas=(0.9, 0.95), mask_type=args.mask_type, args=args
-        )
-    else:
-        # Prepare optimizer and scheduler
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.learning_rate,
-            betas=(0.9, 0.95),
-        )
-
-    
+    optimizer = torch.optim.AdamW(
+        optimizer_grouped_parameters,
+        lr=args.learning_rate,
+        betas=(0.9, 0.95),
+    )
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
@@ -422,7 +477,6 @@ def main():
 
     args.completed_steps = 0
 
-
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
         optimizer=optimizer,
@@ -439,13 +493,15 @@ def main():
         eval_dataloader = accelerator.prepare(eval_dataloader)
 
     best_model = None
-    
+
     # Training function
     def train_epoch(epoch):
         nonlocal best_model, best_eval_loss
         model.train()
         total_loss = 0
         for step, batch in enumerate(train_dataloader):
+            # if args.completed_steps > max_train_steps:
+            #     break
             with accelerator.accumulate(model):
                 outputs = model(**batch)
                 loss = outputs.loss
@@ -489,7 +545,7 @@ def main():
                     and not args.load_last_model
                 ):
                     perplexity, eval_loss = evaluate(model)
-                    accelerator.print(f"Epoch {epoch+1} Step {args.completed_steps}: Eval perplexity = {perplexity:.4f}, Eval loss = {eval_loss:.4f}")
+                    accelerator.print(f"Epoch {epoch+1}: Eval perplexity = {perplexity:.4f}, Eval loss = {eval_loss:.4f}")
                     
                     if eval_loss < best_eval_loss:
                         best_eval_loss = eval_loss
@@ -498,7 +554,9 @@ def main():
                             unwrapped_model = accelerator.unwrap_model(model)
                             best_model = copy.deepcopy(unwrapped_model).to("cpu")
                             print("New best model")
-
+                            
+                            # save_hf_format(unwrapped_model, tokenizer, args)
+                
         return total_loss / len(train_dataloader)
 
     # Evaluation function
@@ -533,6 +591,10 @@ def main():
     if args.val_set_size == 0 and accelerator.is_main_process and args.output_dir:
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
+
+        if args.adapter_name == "hira":
+            unwrapped_model = convert_hira_to_original(args, unwrapped_model)
+            print(model)
         
         save_hf_format(unwrapped_model, tokenizer, args)
 
@@ -544,14 +606,49 @@ def main():
                 f"Validation perplexity: {ppl}, Validation loss: {val_loss}",
                 args.global_rank,
             )
+            print(f"Validation perplexity: {ppl}, Validation loss: {val_loss}")
             if val_loss < best_eval_loss:
                 best_eval_loss = val_loss
                 if args.global_rank == 0:
                     best_model = copy.deepcopy(model.module).to("cpu")
+                final_saved_model_index = "last"
 
         model = best_model if best_model is not None else model
-        save_hf_format(model, tokenizer, args)
 
+        # if args.peft_tuner == 'lora':
+        #     model.save_pretrained(args.output_dir)
+
+        if args.adapter_name in ["lora", "dora", "pissa"]:
+            model = model.merge_and_unload()
+        elif args.adapter_name == "hira":
+            model = convert_hira_to_original(args, model)
+            print(model)
+        save_hf_format(model, tokenizer, args)
+        # save_with_accelerate(accelerator, model, tokenizer, args.output_dir, args)
+
+def save_with_accelerate(accelerator, model, tokenizer, output_dir, args):
+    unwrapped_model = accelerator.unwrap_model(model)
+    # When doing multi-gpu training, we need to use accelerator.get_state_dict(model) to get the state_dict.
+    # Otherwise, sometimes the model will be saved with only part of the parameters.
+    # Also, accelerator needs to use the wrapped model to get the state_dict.
+    state_dict = accelerator.get_state_dict(model)
+    if args.peft_tuner:
+        # When using lora, the unwrapped model is a PeftModel, which doesn't support the is_main_process 
+        # and has its own save_pretrained function for only saving lora modules.
+        # We have to manually specify the is_main_process outside the save_pretrained function.
+        if accelerator.is_main_process:
+            # unwrapped_model.save_pretrained(output_dir, state_dict=state_dict, safe_serialization=False)
+            model = model.merge_and_unload()
+            # model.save_pretrained(output_dir)
+            print(model)
+            model.save_pretrained(
+                output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, state_dict=state_dict
+            )
+    else:
+        unwrapped_model.save_pretrained(
+            output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save, state_dict=state_dict
+        )
 
 if __name__ == "__main__":
     main()
+    os._exit(0)

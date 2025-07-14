@@ -16,7 +16,6 @@ from tqdm.auto import tqdm
 
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
-import torch.nn as nn
 
 import transformers
 from transformers import (
@@ -26,13 +25,28 @@ from transformers import (
     LlamaTokenizer,
     LlamaTokenizerFast,
     SchedulerType,
+    DataCollatorForSeq2Seq,
     get_scheduler,
+    GPTNeoXTokenizerFast,
+    GPT2Tokenizer,
+    OPTForCausalLM,
+    BitsAndBytesConfig,
+    PreTrainedTokenizerFast,
 )
 
 from utils.utils import (
     print_rank_0,
+    to_device,
+    set_random_seed,
     get_all_reduce_mean,
     int_or_float,
+)
+
+from utils.s2_utils import (
+    convert_ffn_layer_to_s2,
+    convert_mha_layer_to_s2,
+    convert_s2_to_linear_layer,
+    only_optimize_s2_parameters,
 )
 
 from accelerate import Accelerator
@@ -40,9 +54,11 @@ from accelerate.utils import set_seed
 
 from utils.model_utils import (
     load_hf_tokenizer,
+    create_hf_model,
     save_hf_format,
     get_optimizer_grouped_parameters,
     make_model_gradient_checkpointing_compatible,
+    print_throughput
 )
 
 from utils.data_utils import SupervisedDataset, DataCollatorForSupervisedDataset
@@ -212,13 +228,6 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--no_grad",
-        type=str,
-        default='none',
-        help="sparse fine-tuning tuner",
-    )
-
-    parser.add_argument(
         "--mask_type",
         type=str,
         default='weight_filtered_mag_abs_largest',
@@ -261,6 +270,12 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--mlp_criterion",
+        type=str,
+        default='random',
+    )
+
+    parser.add_argument(
         "--adapter_name",
         type=str,
         default='none',
@@ -288,32 +303,133 @@ def main():
     # Load tokenizer and model
     tokenizer = load_hf_tokenizer(args.model_name_or_path, fast_tokenizer=True)
     tokenizer.model_max_length = args.max_seq_len
+    
+    model = create_hf_model(
+        AutoModelForCausalLM,
+        args.model_name_or_path,
+        tokenizer,
+        dropout=args.dropout,
+    )
 
-    # Load pretrained model and tokenizer
-    config = AutoConfig.from_pretrained(args.model_name_or_path)
+    if args.s2:
+        print_rank_0("------use S2FT------", args.global_rank)
+        if args.v_ratio > 0 or args.o_ratio > 0:
+            parameters_v = {}
+            parameters_o = {}
+            mha_indices = [
+                i
+                for i in range(
+                    model.config.num_attention_heads * model.config.num_hidden_layers
+                )
+            ]
+            for i in range(model.config.num_hidden_layers):
+                parameters_v[i] = []
+                parameters_o[i] = []
+            num_v = int(
+                model.config.num_attention_heads
+                * model.config.num_hidden_layers
+                * args.v_ratio
+            )
+            num_o = int(
+                model.config.num_attention_heads
+                * model.config.num_hidden_layers
+                * args.o_ratio
+            )
+            select_v = sorted(random.sample(mha_indices, num_v))
+            for v in select_v:
+                parameters_v[v // model.config.num_attention_heads].append(
+                    v % model.config.num_attention_heads
+                )
+            select_o = sorted(random.sample(mha_indices, num_o))
+            for o in select_o:
+                parameters_o[o // model.config.num_attention_heads].append(
+                    o % model.config.num_attention_heads
+                )
+            selected_parameters_mha = {"v_proj": parameters_v, "o_proj": parameters_o}
 
-    if args.model_name_or_path:
-        model_kwargs = {}
-        model_kwargs['torch_dtype'] = torch.bfloat16
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-            use_flash_attention_2=True if args.use_flash_attn == 'True' else False,
-            **model_kwargs
-        )
-    else:
-        # model = AutoModelForCausalLM.from_config(config)
-        model = AutoModelForCausalLM.from_config(config)
+            convert_mha_layer_to_s2(model, selected_parameters_mha)
 
-    model.config.end_token_id = tokenizer.eos_token_id
-    model.config.pad_token_id = model.config.eos_token_id
+        if args.u_ratio > 0 or args.d_ratio > 0:
+            parameters_u = {}
+            parameters_d = {}
+            intermediate_dim = model.config.intermediate_size
+            if args.mlp_criterion == 'random':
+                ffn_indices = [
+                    i for i in range(intermediate_dim * model.config.num_hidden_layers)
+                ]
+                for i in range(model.config.num_hidden_layers):
+                    parameters_u[i] = []
+                    parameters_d[i] = []
+                num_u = int(intermediate_dim * model.config.num_hidden_layers * args.u_ratio)
+                num_d = int(intermediate_dim * model.config.num_hidden_layers * args.d_ratio)
+                select_u = sorted(random.sample(ffn_indices, num_u))
+                for u in select_u:
+                    parameters_u[u // intermediate_dim].append(u % intermediate_dim)
+                select_d = sorted(random.sample(ffn_indices, num_d))
+                for d in select_d:
+                    parameters_d[d // intermediate_dim].append(d % intermediate_dim)
+            
+            elif args.mlp_criterion == 'lra':
+                filter_rank = args.filter_rank
+                for i in range(model.config.num_hidden_layers):
+                    parameters_u[i] = []
+                    parameters_d[i] = []
+                num_u = int(intermediate_dim * args.u_ratio)
+                num_d = int(intermediate_dim * args.d_ratio)
+                u_count = 0
+                d_count = 0
+                for name, p in model.named_parameters():
+                    if 'up' in name and 'weight' in name and num_u > 0:
+                        u, s, v = torch.svd(p.data.to(torch.float32).to(torch.device("cuda")))
+                        # filter out the top k singular values
+                        if 'hybrid' in args.mask_type:
+                            s[filter_rank // 2: -filter_rank // 2] = 0
+                        elif 'random' in args.mask_type:
+                            random_indices = torch.randperm(s.shape[0])
+                            s[random_indices[filter_rank:]] = 0
+                        elif 'least' in args.mask_type:
+                            s[: -filter_rank] = 0
+                        else:
+                            s[filter_rank:] = 0
+                        # reconstruct the matrix
+                        reconstructed = torch.mm(u, torch.mm(torch.diag(s), v.T))
+                        assert reconstructed.shape[1] == intermediate_dim, f"{name}, shape: {reconstructed.shape}"
+                        up_sum = torch.sum(reconstructed, dim=0)
+                        _, top_u = torch.topk(up_sum, k=num_u, dim=0, largest=True, sorted=True)
+                        parameters_u[u_count] = top_u.tolist()
+                        print(f"up_proj indices: {top_u}")
+                        u_count += 1
 
-    model.resize_token_embeddings(int(
-        8 *
-        math.ceil(len(tokenizer) / 8.0)))  # make the vocab size multiple of 8
+                    elif 'down' in name and 'weight' in name and num_d > 0:
+                        u, s, v = torch.svd(p.data.to(torch.float32).to(torch.device("cuda")))
+                        # filter out the top k singular values
+                        if 'hybrid' in args.mask_type:
+                            s[filter_rank // 2: -filter_rank // 2] = 0
+                        elif 'random' in args.mask_type:
+                            random_indices = torch.randperm(s.shape[0])
+                            s[random_indices[filter_rank:]] = 0
+                        elif 'least' in args.mask_type:
+                            s[: -filter_rank] = 0
+                        else:
+                            s[filter_rank:] = 0
+                        # reconstruct the matrix
+                        reconstructed = torch.mm(u, torch.mm(torch.diag(s), v.T))
+                        assert reconstructed.shape[1] == intermediate_dim, f"{name}, shape: {reconstructed.shape}, intermediate: {intermediate_dim}"
+                        down_sum = torch.sum(reconstructed, dim=0)
+                        _, top_d = torch.topk(down_sum, k=num_d, dim=0, largest=True, sorted=True)
+                        parameters_u[d_count] = top_d.tolist()
+                        print(f"down_proj indices: {top_d}")
+                        d_count += 1
+
+            selected_parameters_ffn = {"up_proj": parameters_u, "down_proj": parameters_d}
+            convert_ffn_layer_to_s2(model, selected_parameters_ffn)
+
+        model = only_optimize_s2_parameters(model)
+        model = make_model_gradient_checkpointing_compatible(model)
+
+        print_rank_0(f"learning rate: {args.learning_rate}", args.global_rank)
         
-    if args.gradient_checkpointing:
+    elif args.gradient_checkpointing:
         model = make_model_gradient_checkpointing_compatible(model)
         model.gradient_checkpointing_enable()
 
@@ -334,24 +450,10 @@ def main():
     else:
         raise ValueError("Only json format is supported for now.")
 
-    if 'sparse' in args.peft_tuner:
-        layer_dict = {
-            'q': 'q_proj',
-            'k': 'k_proj',
-            'v': 'v_proj',
-            'o': 'o_proj',
-            'gate': 'gate_proj',
-            'up': 'up_proj',
-            'down': 'down_proj'
-        }
-        no_grad_params = ["bias", "layernorm", "norm"]
-        for char, val in layer_dict.items():
-            if char == 'o':
-                char = 'o_'
-            if char in args.no_grad:
-                no_grad_params.append(val)
-        if 'head' in args.no_grad:
-            no_grad_params += ['lm_head', "embed_tokens"]
+    if args.peft_tuner in ['sparse_weight_mag']:
+        no_grad_params = ["bias", "layernorm", "embed_tokens", "norm", "lm_head"]
+        # no_grad_params = ["bias", "layernorm", "embed_tokens", "norm"]
+        # stop model.embed_tokens.weight from being updated
         for name, param in model.named_parameters():
             if any([s in name for s in no_grad_params]):
                 param.requires_grad = False
@@ -383,11 +485,11 @@ def main():
        args, model, args.weight_decay, args.learning_rate
     )
 
-    ## Init optimizer
-    if 'sparse' in args.peft_tuner:
+    ## Init deepspeed optimizer
+    if args.peft_tuner in ['sparse_weight_mag']:
         from sparseAdam import SparseAdamW
         optimizer = SparseAdamW(
-            optimizer_grouped_parameters, lr=args.learning_rate, betas=(0.9, 0.95), mask_type=args.mask_type, args=args
+            optimizer_grouped_parameters, lr=args.learning_rate, betas=(0.9, 0.95), mask_type=args.mask_type
         )
     else:
         # Prepare optimizer and scheduler
@@ -439,7 +541,7 @@ def main():
         eval_dataloader = accelerator.prepare(eval_dataloader)
 
     best_model = None
-    
+
     # Training function
     def train_epoch(epoch):
         nonlocal best_model, best_eval_loss
@@ -449,14 +551,13 @@ def main():
             with accelerator.accumulate(model):
                 outputs = model(**batch)
                 loss = outputs.loss
-                accelerator.backward(loss)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                
+                accelerator.backward(loss)                
                 total_loss += loss.detach().float()
 
             if accelerator.sync_gradients:
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
                 progress_bar.update(1)
                 args.completed_steps += 1
                 # if accelerator.is_main_process and step % 100 == 0:
@@ -489,7 +590,7 @@ def main():
                     and not args.load_last_model
                 ):
                     perplexity, eval_loss = evaluate(model)
-                    accelerator.print(f"Epoch {epoch+1} Step {args.completed_steps}: Eval perplexity = {perplexity:.4f}, Eval loss = {eval_loss:.4f}")
+                    accelerator.print(f"Epoch {epoch+1}: Eval perplexity = {perplexity:.4f}, Eval loss = {eval_loss:.4f}")
                     
                     if eval_loss < best_eval_loss:
                         best_eval_loss = eval_loss
@@ -498,7 +599,9 @@ def main():
                             unwrapped_model = accelerator.unwrap_model(model)
                             best_model = copy.deepcopy(unwrapped_model).to("cpu")
                             print("New best model")
-
+                            
+                            # save_hf_format(unwrapped_model, tokenizer, args)
+                
         return total_loss / len(train_dataloader)
 
     # Evaluation function
@@ -544,12 +647,17 @@ def main():
                 f"Validation perplexity: {ppl}, Validation loss: {val_loss}",
                 args.global_rank,
             )
+            print(f"Validation perplexity: {ppl}, Validation loss: {val_loss}")
             if val_loss < best_eval_loss:
                 best_eval_loss = val_loss
                 if args.global_rank == 0:
                     best_model = copy.deepcopy(model.module).to("cpu")
+                final_saved_model_index = "last"
 
         model = best_model if best_model is not None else model
+        if args.s2:
+            print_rank_0("converting s2 to linear layer ...", args.global_rank)
+            model = convert_s2_to_linear_layer(model)
         save_hf_format(model, tokenizer, args)
 
 

@@ -1,0 +1,17 @@
+MODEL                               adapter_name                lr              lora_r              lora_alpha                seed
+
+meta-llama/Llama-2-7b-hf             lora                 2e-4             128                      256                     43
+meta-llama/Llama-2-7b-hf             dora                 2e-4             64                      128                     43
+meta-llama/Llama-2-7b-hf             pissa                 2e-4             128                      128                     43
+
+meta-llama/Meta-Llama-3-8B             lora                 2e-4             64                      128                     43
+meta-llama/Meta-Llama-3-8B             dora                 2e-4             64                      128                     43
+meta-llama/Meta-Llama-3-8B             pissa                 2e-4             128                      128                     43
+
+meta-llama/Llama-3.2-3B             lora                 2e-4             128                      256                     43
+meta-llama/Llama-3.2-3B             dora                 2e-4             128                      256                     43
+meta-llama/Llama-3.2-3B             pissa                 2e-4             128                      128                     43
+
+meta-llama/Llama-3.2-3B             lora                 2e-4             128                      256                     43
+meta-llama/Llama-3.2-3B             dora                 2e-4             128                      256                     43
+meta-llama/Llama-3.2-3B             pissa                 2e-4             128                      128                     43

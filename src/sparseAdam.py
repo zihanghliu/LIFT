@@ -56,7 +56,8 @@ class SparseAdamW(Optimizer):
         weight_decay: float = 0.0,
         correct_bias: bool = True,
         no_deprecation_warning: bool = False,
-        mask_type: str = "weight_filtered_mag_abs_largest",
+        mask_type: str = "lift_sparse",
+        args=None,
     ):
         if not no_deprecation_warning:
             warnings.warn(
@@ -83,6 +84,7 @@ class SparseAdamW(Optimizer):
         # self.checksparsity()
         self.state['total_step'] = 0
         self.update_proj_gap = 1e8 # initialize it as extremely large value and will be updated in step function
+        self.args = args
 
     def update_masks(self):
         for idx, p in enumerate(self.param_groups[0]['params']):
@@ -101,10 +103,118 @@ class SparseAdamW(Optimizer):
                 del prev_mask
 
             # update masks
-            if "weight_filtered_mag" in self.mask_type:
+            if "lift" in self.mask_type:
                 # perform svd
                 filter_rank = self.param_groups[0]['filter_rank']
+                if 'rand' in self.mask_type:
+                    q = min(filter_rank * 2, min(p.shape))
+                    U, S, V = torch.svd_lowrank(p.data.to(torch.float32).to(torch.device("cuda")), q=q, niter=self.args.niter)
+                else:
+                    U, S, V = torch.svd(p.data.to(torch.float32).to(torch.device("cuda")))
+
+                # filter out the top k singular values
+                U_, S_, V_ = U[:, :filter_rank], S[:filter_rank], V[:, :filter_rank]
+
+                # reconstruct the matrix
+                SV = S_.unsqueeze(-1) * V_.T
+                reconstructed = torch.matmul(U_, SV)
+                flattened = torch.abs(reconstructed.data).flatten()
+                
+                if lora_rank > 0:
+                    top_k_indices = torch.topk(flattened, k=sparsity, largest=largest).indices
+                    mask = torch.zeros_like(flattened, dtype=torch.bool)
+                    mask[top_k_indices] = True
+                    state['mask'] = mask.view(p.shape).to('cpu')
+                else:
+                    state['mask'] = torch.ones_like(p, dtype=torch.bool).to('cpu')
+
+            elif self.mask_type in ['movement', 'movement_vec']:
+                state['mask'] = self.param_groups[-1]['params'][idx]
+                
+            elif 'movement_v2' in self.mask_type:
+                if 'mvmt_score' in state:
+                    flattened = state['mvmt_score'].flatten()
+                else:
+                    state['mvmt_score'] = torch.zeros_like(p)
+                    flattened = torch.rand_like(p).flatten()
+                if lora_rank > 0:
+                    top_k_indices = torch.topk(flattened, k=sparsity, largest=largest).indices
+                    mask = torch.zeros_like(flattened, dtype=torch.bool)
+                    mask[top_k_indices] = True
+                    state['mask'] = mask.view(p.shape)
+                else:
+                    state['mask'] = torch.ones_like(p, dtype=torch.bool)
+
+            elif "hessian" in self.mask_type:
+                if 'hessian' in state:
+                    flattened = state['hessian'].flatten()
+                else:
+                    state['hessian'] = torch.zeros_like(p)
+                    flattened = torch.rand_like(p).flatten()
+                if lora_rank > 0:
+                    top_k_indices = torch.topk(flattened, k=sparsity, largest=largest).indices
+                    mask = torch.zeros_like(flattened, dtype=torch.bool)
+                    mask[top_k_indices] = True
+                    state['mask'] = mask.view(p.shape)
+                else:
+                    state['mask'] = torch.ones_like(p, dtype=torch.bool)
+
+            elif "grad_mag" in self.mask_type:
+                if 'grad' in state:
+                    flattened = torch.abs(state['grad']).flatten()
+                else:
+                    state['grad'] = torch.zeros_like(p)
+                    flattened = torch.rand_like(p).flatten()
+                if lora_rank > 0:
+                    top_k_indices = torch.topk(flattened, k=sparsity, largest=largest).indices
+                    mask = torch.zeros_like(flattened, dtype=torch.bool)
+                    mask[top_k_indices] = True
+                    state['mask'] = mask.view(p.shape)
+                else:
+                    state['mask'] = torch.ones_like(p, dtype=torch.bool)
+
+            elif "weight_mag" in self.mask_type:
+                if 'abs' in self.mask_type:
+                    flattened = torch.abs(p.data).flatten()
+                else:
+                    flattened = p.data.flatten()
+                if lora_rank > 0:
+                    top_k_indices = torch.topk(flattened, k=sparsity, largest=largest).indices
+                    mask = torch.zeros_like(flattened, dtype=torch.bool)
+                    mask[top_k_indices] = True
+                    state['mask'] = mask.view(p.shape)
+                else:
+                    state['mask'] = torch.ones_like(p, dtype=torch.bool)
+
+            elif "stable_rank_filter" in self.mask_type:
                 u, s, v = torch.svd(p.data.to(torch.float32).to(torch.device("cuda")))
+                # get the stable rank
+                frob_norm_sq = torch.sum(s ** 2)
+                spectral_norm_sq = torch.max(s) ** 2
+                stable_rank = frob_norm_sq / spectral_norm_sq
+                sparsity = min((p.shape[0] + p.shape[1]) * stable_rank, p.shape[0] * p.shape[1])
+                # filter out the top k singular values
+                filter_rank = int(stable_rank)
+                s[filter_rank:] = 0
+                # reconstruct the matrix
+                reconstructed = torch.mm(u, torch.mm(torch.diag(s), v.T))
+                if 'abs' in self.mask_type:
+                    flattened = torch.abs(reconstructed.data).flatten()
+                else:
+                    flattened = reconstructed.data.flatten()
+
+                top_k_indices = torch.topk(flattened, k=sparsity, largest=largest).indices
+                mask = torch.zeros_like(flattened, dtype=torch.bool)
+                mask[top_k_indices] = True
+                state['mask'] = mask.view(p.shape).to('cpu')
+
+            elif "grad_filtered_mag" in self.mask_type:
+                # perform svd
+                filter_rank = self.param_groups[0]['filter_rank']
+                if 'exp_avg' not in state:
+                    u, s, v = torch.svd(p.data.to(torch.float32).to(torch.device("cuda")))
+                else:
+                    u, s, v = torch.svd(state['exp_avg'].to(torch.float32).to(torch.device("cuda")))
                 # filter out the top k singular values
                 if 'hybrid' in self.mask_type:
                     s[filter_rank // 2: -filter_rank // 2] = 0
@@ -125,9 +235,37 @@ class SparseAdamW(Optimizer):
                     top_k_indices = torch.topk(flattened, k=sparsity, largest=largest).indices
                     mask = torch.zeros_like(flattened, dtype=torch.bool)
                     mask[top_k_indices] = True
-                    state['mask'] = mask.view(p.shape).to('cpu')
+                    state['mask'] = mask.view(p.shape)
                 else:
-                    state['mask'] = torch.ones_like(p, dtype=torch.bool).to('cpu')
+                    state['mask'] = torch.ones_like(p, dtype=torch.bool)
+
+
+            elif "momentum" in self.mask_type:
+                if 'exp_avg' in state:
+                    flattened = torch.abs(state['exp_avg']).flatten()
+                else:
+                    flattened = torch.rand_like(p).flatten()
+                if lora_rank > 0:
+                    top_k_indices = torch.topk(flattened, k=sparsity, largest=largest).indices
+                    mask = torch.zeros_like(flattened, dtype=torch.bool)
+                    mask[top_k_indices] = True
+                    state['mask'] = mask.view(p.shape)
+                else:
+                    state['mask'] = torch.ones_like(p, dtype=torch.bool)
+
+            elif 'adam_mag' in self.mask_type:
+                if 'adam_update' in state:
+                    flattened = torch.abs(state['adam_update']).flatten()
+                else:
+                    state['adam_update'] = torch.zeros_like(p)
+                    flattened = torch.rand_like(p).flatten()
+                if lora_rank > 0:
+                    top_k_indices = torch.topk(flattened, k=sparsity, largest=largest).indices
+                    mask = torch.zeros_like(flattened, dtype=torch.bool)
+                    mask[top_k_indices] = True
+                    state['mask'] = mask.view(p.shape)
+                else:
+                    state['mask'] = torch.ones_like(p, dtype=torch.bool)
 
             else:
                 if 'block' in self.mask_type:
@@ -155,6 +293,41 @@ class SparseAdamW(Optimizer):
                 state['exp_avg'] = prev_exp_avg[curr_mask]
                 state['exp_avg_sq'] = prev_exp_avg_sq[curr_mask]
                 del prev_exp_avg, prev_exp_avg_sq, curr_mask
+
+    def update_mask_act(self, activations):
+        assert len(activations) == len(self.param_groups[0]['params']), f"activations len: {len(activations)}, masked param len: {len(self.param_groups[0]['params'])}"
+        for p, (key, act) in zip(self.param_groups[0]['params'], activations.items()):
+            state = self.state[p]
+            assert act.shape == p.shape, f"activation shape: {act.shape}, param shape: {p.shape}"
+            beta1, beta2 = self.param_groups[0]["betas"]
+            largest = 'largest' in self.mask_type
+            lora_rank = self.param_groups[0]['rank']
+            sparsity = min((p.shape[0] + p.shape[1]) * lora_rank, p.shape[0] * p.shape[1])
+
+            if 'abs' in self.mask_type:
+                flattened = torch.abs(act.data).flatten()
+            else:
+                flattened = act.data.flatten()
+            if lora_rank > 0:
+                top_k_indices = torch.topk(flattened, k=sparsity, largest=largest).indices
+                mask = torch.zeros_like(flattened, dtype=torch.bool)
+                mask[top_k_indices] = True
+                state['mask'] = mask.view(p.shape)
+            else:
+                state['mask'] = torch.ones_like(p, dtype=torch.bool)
+
+        print(f"Completed Mask Update by Activation SVD")
+    
+    def checksparsity(self):
+        total_num=0
+        non_zero_num=0
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state[p]
+                if "rank" in group:
+                    total_num+=state['mask'].numel()
+                    non_zero_num+=state['mask'].sum().item()
+        print("density",non_zero_num/total_num)
 
     @torch.no_grad()
     def step(self, closure: Callable = None):
@@ -187,17 +360,27 @@ class SparseAdamW(Optimizer):
                     group['dim'] = 2
                 # GaLore Projection
                 if "rank" in group:
+                    # if (self.state['total_step'] + 1) % self.update_proj_gap == 0:
+                    # update hessian
+                    if "hessian" in self.mask_type:
+                        state['hessian'].mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                    if "grad_mag" in self.mask_type:
+                        state['grad'] = grad
+                    if self.mask_type in ['movement_v2']:
+                        state['mvmt_score'].add_(-0.01 * p.grad * p.data)
                     update_mask = state['mask'].to(p.device).bool()
                     if 'sparse' in self.mask_type:
                         grad = grad[update_mask]
 
+                    if "obs" in self.mask_type and (self.state['total_step'] + 1) % self.update_proj_gap == 0:
+                        state['finvs'].add_grad(p.grad.reshape(-1).clone().detach().cpu())
                         
                 if "exp_avg" not in state:
                     # Exponential moving average of gradient values
                     state["exp_avg"] = torch.zeros_like(grad)
                     # Exponential moving average of squared gradient values
                     state["exp_avg_sq"] = torch.zeros_like(grad)
-            
+
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
 
                 state["step"] += 1
@@ -239,6 +422,7 @@ class SparseAdamW(Optimizer):
 
         self.state['total_step'] += 1 
         if self.state['total_step'] != 0:
+            # if (self.state['total_step'] + 1) % self.update_proj_gap == 0 or self.state['total_step'] == 100:
             if (self.state['total_step'] + 1) % self.update_proj_gap == 0:
                 if "weight_filtered_mag_act" not in self.mask_type:
                     self.update_masks()

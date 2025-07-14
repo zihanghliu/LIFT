@@ -11,7 +11,8 @@ Zihang Liu, Tianyu Pang, Oleg Balabanov, Chaoqun Yang, Tianjin Huang, Lu Yin, Ya
 Recent studies have shown that supervised fine-tuning of LLMs on a small number of high-quality datasets can yield strong reasoning capabilities. However, full fine-tuning (Full FT), while powerful, is computationally expensive and susceptible to overfitting and catastrophic forgetting, particularly when data is limited. Sparse fine-tuning, which previously achieved notable success by updating only a small subset of model parameters, offers a promising trade-off between efficiency and effectiveness. Yet, it has lagged behind in the LLM era due to the difficulty of identifying parameters truly critical for reasoning. In this work, we state that weights with the largest magnitude after low-rank approximation are critical weights for fine-tuning, which we call *Principal Weights*. Surprisingly, while magnitude-based sparse fine-tuning performs poorly as a baseline on LLM fine-tuning, it becomes highly effective after rank reduction. These insights motivate our method: **L**ow-rank **I**nformed Sparse **F**ine-**T**uning (**LIFT**). **LIFT** only updates the top 5% *Principal Weights* throughout training and consistently achieves better performance on reasoning tasks than Full FT, while maintaining memory efficiency on par with popular parameter-efficient fine-tuning methods.  In addition to strong performance on target domains such as arithmetic reasoning, **LIFT** also retains up to 20% more source-domain knowledge, compared to Full FT and LoRA.
 
 ## Update
-- [x] (6.2.2025) We released the code for LIFT on arithmetic reasoning tasks.
+- [x] (June 2025) We released the code for LIFT on arithmetic reasoning tasks.
+- [x] (July 2025) We released the code for all baselines of our main results in arithmetic and commonsense reasoning tasks. Stay tuned for more updates!
 
 ## Installation
 ```bash
@@ -53,7 +54,7 @@ for name, param in model.named_parameters():
 # set hyperparameters
 lora_rank = ...  # rank for low-rank approximation, recommended to be 128
 filter_rank = ...  # rank for low rank approximation, recommended to be 128
-update_interval = ...  # update interval for the projection matrix
+update_interval = ...  # interval for updating the mask
 
 optimizer_grouped_parameters = [
     {
@@ -85,20 +86,64 @@ optimizer = SparseAdamW(
 )
 ```
 
-### Example: Fine-tuning LLaMA-2-7B on MATH-10K with LIFT
-In ```./bash_scripts/finetune_math_lift_llama2_7b.sh```, change the following directories to your actual directories:
+### Main Results: Arithmetic Reasoning
+The main results for `LIFT` and all baselines on arithmetic reasoning tasks can be reproduced by running the following scripts.
+```bash
+bash ./bash_scripts/finetune_math_full.sh ${TASK_ID}
+bash ./bash_scripts/finetune_math_lift.sh ${TASK_ID}
+bash ./bash_scripts/finetune_math_s2ft.sh ${TASK_ID}
+bash ./bash_scripts/finetune_math_lora.sh ${TASK_ID}
+```
+Where `${TASK_ID}` is the task line ID for the arithmetic reasoning tasks, which can be found in the following config files.
+```bash
+bash_scripts/slurm_config_lift_math.txt
+bash_scripts/slurm_config_full_math.txt
+bash_scripts/slurm_config_s2ft_math.txt
+bash_scripts/slurm_config_lora_math.txt
+```
+For example, to run the configuration of the 1st line, replace `${TASK_ID}` with `1`.
+
+Before running the script, change the following directories in the bash script to your actual directories:
 ```bash
 SRC_DIR=/enter/your/path/to/the/repo
 DATA_DIR=/enter/your/data/dir
 OUTPUT_SRC_DIR=/enter/your/output/dir
 ```
-Then in ```./bash_scripts/eval_math.sh```, change corresponding directories to actual directories:
+Then in ```./bash_scripts/eval_math.sh``` and ```./bash_scripts/eval_math_lora.sh```, change corresponding directories to actual directories:
 ```bash
 SRC_DIR=/enter/your/path/to/the/repo
 DATA_DIR=/enter/your/data/dir
 ```
-Then, run the training script:
+
+### Main Results: Commonsense Reasoning
+Similarly, the main results for `LIFT` and all baselines on commonsense reasoning tasks can be reproduced by running the following scripts.
 ```bash
-bash ./bash_scripts/finetune_math_lift_llama2_7b.sh
+bash ./bash_scripts/finetune_commonsense_full.sh ${TASK_ID}
+bash ./bash_scripts/finetune_commonsense_lift.sh ${TASK_ID}
+bash ./bash_scripts/finetune_commonsense_s2ft.sh ${TASK_ID}
+bash ./bash_scripts/finetune_commonsense_lora.sh ${TASK_ID}
 ```
-It will automatically run fine-tuning LLaMA-2-7B on MATH-10K with `LIFT` method, and run evaluation on seven arithmetic reasoning tasks.
+Where the `${TASK_ID}` is the task line ID for the commonsense reasoning tasks, which can be found in the following config files.
+```bash
+bash_scripts/slurm_config_lift_commonsense.txt
+bash_scripts/slurm_config_full_commonsense.txt
+bash_scripts/slurm_config_s2ft_commonsense.txt
+bash_scripts/slurm_config_lora_commonsense.txt
+```
+## Citation
+If you find our work useful, please consider citing our paper:
+```bibtex
+@inproceedings{
+liu2025lift,
+    title={{LIFT} the Veil for the Truth: Principal Weights Emerge after Rank Reduction for Reasoning-Focused Supervised Fine-Tuning},
+    author={Zihang Liu and Tianyu Pang and Oleg Balabanov and Chaoqun Yang and Tianjin Huang and Lu Yin and Yaoqing Yang and Shiwei Liu},
+    booktitle={Forty-second International Conference on Machine Learning},
+    year={2025},
+    url={https://openreview.net/forum?id=XHHIZNgrho}
+}
+```
+## Acknolwedgements
+We would like to sincerely thank the creators of the following repositories for their codebase and inspiration to the implementations in our work:
+- [Llama-Adapter](https://github.com/AGI-Edgerunners/LLM-Adapters)
+- [S2FT](https://github.com/Infini-AI-Lab/S2FT)
+- [Stable-SPAM](https://github.com/TianjinYellow/StableSPAM)

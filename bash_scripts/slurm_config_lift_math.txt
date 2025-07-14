@@ -1,0 +1,7 @@
+MODEL                             no_grad       mask             lr           lora_rank      filter_rank     update_interval        seed
+
+meta-llama/Llama-3.2-3B           head           lift_sparse            2e-4              128              64                  10              43
+meta-llama/Llama-3.2-1B           head           lift_sparse            2e-4              128              32                  400              43
+meta-llama/Llama-2-7b-hf           head           lift_sparse            2e-4              128              64                  400              43
+meta-llama/Meta-Llama-3-8B          head           lift_sparse            1e-4              128              128                  400              43
+

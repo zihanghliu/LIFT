@@ -1,0 +1,5 @@
+#MODEL                              lr           seed
+meta-llama/Llama-2-7b-hf           5e-5              43
+meta-llama/Meta-Llama-3-8B          5e-5              43    
+meta-llama/Llama-3.2-3B           5e-5              43
+meta-llama/Llama-3.2-1B           5e-5              43
